@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exam-grader"
+version = "0.1.0"
+description = "Multi-modal exam grading suite — answer-key extraction, ensemble grading, bias auditing, rubric drift, Canvas posting"
+requires-python = ">=3.11"
+authors = [{ name = "C.D. Lee" }]
+dependencies = [
+    "anthropic>=0.40.0",
+    "Pillow>=10.0.0",
+    "PyMuPDF>=1.24.0",
+    "click>=8.1.0",
+    "openpyxl>=3.1.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.0.0",
+    "requests>=2.31.0",
+    "handwriting-engine @ git+https://github.com/opencdlee-dotcom/handwriting-engine.git@main",
+]
+
+[project.optional-dependencies]
+canvas = ["playwright>=1.40.0"]
+openai = ["openai>=1.50.0"]
+gemini = ["google-genai>=1.0.0"]
+all = [
+    "playwright>=1.40.0",
+    "openai>=1.50.0",
+    "google-genai>=1.0.0",
+]
+dev = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["grader*", "grading_intelligence*", "canvas*"]
