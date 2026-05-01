@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "raphael": {
+      "command": "node",
+      "args": ["/Users/user/Documents/Work & Projects/VSCode Projects/claude/Raphael/engine/dist/bridge/mcp-server.js"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/user/Documents/Work & Projects/VSCode Projects/exam-grader"]
+    }
+  }
+}
