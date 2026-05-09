@@ -210,6 +210,19 @@ def _execute_claude(
             rate_limiter.acquire()
             response = client.messages.create(**kwargs)
             circuit_breaker.record_success()
+            # Cache-hit telemetry: log creation vs read so callers can
+            # confirm the cache_control ephemeral marker is actually
+            # being honored. On call 1 we expect creation > 0; on calls
+            # 2..N within the 5-min TTL we expect read > 0.
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                logger.info(
+                    "claude tokens: in=%d out=%d cache_write=%d cache_read=%d",
+                    getattr(usage, "input_tokens", 0) or 0,
+                    getattr(usage, "output_tokens", 0) or 0,
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                    getattr(usage, "cache_read_input_tokens", 0) or 0,
+                )
             return response.content[0].text
         except anthropic.RateLimitError as e:
             circuit_breaker.record_failure()
