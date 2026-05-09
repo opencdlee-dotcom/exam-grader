@@ -396,14 +396,32 @@ def _encode_image(image_path: str) -> tuple[str, str]:
 
 def new_usage_tracker() -> dict:
     """Create a fresh token usage tracker."""
-    return {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "api_calls": 0,
+    }
 
 
 def _accumulate_usage(tracker: dict, response) -> None:
-    """Extract and accumulate token usage from an API response."""
+    """Extract and accumulate token usage from an API response.
+
+    Tracks cache_creation / cache_read separately so callers can verify
+    the prompt-caching speedup is real: on call 1 of a batch creation
+    grows; on calls 2..N within the 5-min TTL read grows.
+    """
     if hasattr(response, "usage"):
-        tracker["input_tokens"] += getattr(response.usage, "input_tokens", 0)
-        tracker["output_tokens"] += getattr(response.usage, "output_tokens", 0)
+        usage = response.usage
+        tracker["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+        tracker["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+        tracker["cache_creation_input_tokens"] += (
+            getattr(usage, "cache_creation_input_tokens", 0) or 0
+        )
+        tracker["cache_read_input_tokens"] += (
+            getattr(usage, "cache_read_input_tokens", 0) or 0
+        )
     tracker["api_calls"] += 1
 
 
@@ -411,10 +429,12 @@ def print_usage(tracker: dict, label: str = "") -> None:
     """Log a formatted token usage summary."""
     prefix = f"[{label}] " if label else ""
     logger.info(
-        "%sTokens: %s in / %s out across %d API call(s)",
+        "%sTokens: %s in / %s out / %s cached_write / %s cached_read across %d API call(s)",
         prefix,
         f"{tracker['input_tokens']:,}",
         f"{tracker['output_tokens']:,}",
+        f"{tracker.get('cache_creation_input_tokens', 0):,}",
+        f"{tracker.get('cache_read_input_tokens', 0):,}",
         tracker["api_calls"],
     )
 
