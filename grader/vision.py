@@ -8,8 +8,11 @@ Provider-specific model is set via CLAUDE_MODEL / OPENAI_MODEL / GEMINI_MODEL.
 
 import base64
 import logging
+import os
 import random
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from grader.config import (
     ANTHROPIC_API_KEY,
     CLAUDE_MODEL,
@@ -205,11 +208,167 @@ def _get_client():
 
 
 def _build_provider_client(provider: str):
-    """Return a provider client when the active SDK needs one."""
+    """Return a provider client when the active SDK needs one.
+
+    Returns None for the claude branch when no API key is configured but
+    a no-key path (Playwright session or CLI) is available — the caller
+    will route through ``_call_claude_no_key`` instead of the SDK.
+    """
     active = normalize_grading_provider(provider)
     if active == "claude":
+        api_key = get_grading_api_key("claude")
+        if not api_key or api_key == "your-api-key-here":
+            if _no_key_claude_available():
+                return None
         return _get_client()
     return None
+
+
+# ── No-key Claude dispatch (Playwright / CLI) ────────────────────────────────
+# Mirrors the chain in lab-notebook-grader so exam grading can run on the
+# user's claude.ai session or `claude` CLI without burning API tokens.
+
+def _no_key_claude_available() -> bool:
+    """True when at least one no-key path to Claude is reachable."""
+    try:
+        from notebook_grader.playwright_grader import is_playwright_grader_available
+        if is_playwright_grader_available():
+            return True
+    except ImportError:
+        pass
+    try:
+        from notebook_grader.claude_cli import is_claude_cli_available
+        if is_claude_cli_available():
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _have_anthropic_api_key() -> bool:
+    api_key = get_grading_api_key("claude")
+    return bool(api_key) and api_key != "your-api-key-here"
+
+
+def _image_blocks_to_temp_files(image_blocks: list[dict]) -> tuple[list[str], str]:
+    """Decode Anthropic-format base64 image blocks to a temp dir of jpg files.
+
+    Returns ``(file_paths, temp_dir)``. Caller is responsible for removing
+    ``temp_dir`` once the request is done. Text labels (``[Page N]``) are
+    skipped — they're a hint for the API path that doesn't survive the
+    Playwright/CLI round-trip cleanly.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="exam_grader_nokey_")
+    paths: list[str] = []
+    page_index = 0
+    for block in image_blocks:
+        if block.get("type") != "image":
+            continue
+        src = block.get("source") or {}
+        b64_data = src.get("data")
+        media_type = src.get("media_type", "image/jpeg")
+        if not b64_data:
+            continue
+        ext = ".jpg"
+        if "png" in media_type:
+            ext = ".png"
+        elif "webp" in media_type:
+            ext = ".webp"
+        page_index += 1
+        out_path = os.path.join(temp_dir, f"page_{page_index:02d}{ext}")
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(b64_data))
+        paths.append(out_path)
+    return paths, temp_dir
+
+
+def _call_claude_no_key(
+    image_blocks: list[dict],
+    prompt: str,
+    system_prompt: str,
+    tracker: dict | None,
+) -> str:
+    """Send images + prompt to Claude through Playwright (preferred) or CLI.
+
+    Returns raw response text. Raises RuntimeError when both paths fail.
+    """
+    image_paths, temp_dir = _image_blocks_to_temp_files(image_blocks)
+    if not image_paths:
+        raise RuntimeError(
+            "_call_claude_no_key: no decodable image blocks supplied"
+        )
+    # claude.ai / CLI have no separate system slot — fold the system prompt
+    # into the user message so the grading instructions still apply.
+    full_prompt = (
+        f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+    )
+
+    try:
+        try:
+            from notebook_grader.playwright_grader import (
+                grade_text_via_playwright,
+                is_playwright_grader_available,
+            )
+            playwright_ok = is_playwright_grader_available()
+        except ImportError:
+            playwright_ok = False
+            grade_text_via_playwright = None  # type: ignore
+
+        last_error: Exception | None = None
+        if playwright_ok and grade_text_via_playwright is not None:
+            try:
+                logger.info(
+                    "Routing claude grading through Playwright (no-key path), %d pages",
+                    len(image_paths),
+                )
+                text = grade_text_via_playwright(image_paths, full_prompt)
+                if tracker is not None:
+                    tracker["api_calls"] += 1
+                return text
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "Playwright no-key path failed (%s); falling back to claude CLI",
+                    exc,
+                )
+
+        try:
+            from notebook_grader.claude_cli import (
+                grade_text_via_cli,
+                is_claude_cli_available,
+            )
+            cli_ok = is_claude_cli_available()
+        except ImportError:
+            cli_ok = False
+            grade_text_via_cli = None  # type: ignore
+
+        if cli_ok and grade_text_via_cli is not None:
+            logger.info(
+                "Routing claude grading through `claude` CLI (no-key path), %d pages",
+                len(image_paths),
+            )
+            text = grade_text_via_cli(image_paths, full_prompt)
+            if tracker is not None:
+                tracker["api_calls"] += 1
+            return text
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(
+            "No-key claude path unreachable: neither Playwright session nor "
+            "`claude` CLI is available."
+        )
+    finally:
+        # Best-effort cleanup; never let cleanup mask a grading exception.
+        try:
+            for p in image_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
 
 
 def _should_retry_with_smaller_images(exc: Exception, provider: str) -> bool:
@@ -305,6 +464,14 @@ def _grade_chunk(
                 return _call_gemini_vision(image_blocks, prompt, system_prompt, max_tokens, tracker)
 
             # ── Anthropic / Claude path ───────────────────────────────────────
+            # No-key fast path: when there's no API key but the user has a
+            # logged-in claude.ai session or `claude` CLI on PATH, route
+            # through that. Mirrors lab-notebook-grader's chain so exam +
+            # notebook grading share one mental model. Tracker still ticks
+            # api_calls so usage logs are honest, but no tokens are spent.
+            if active == "claude" and not _have_anthropic_api_key() and _no_key_claude_available():
+                return _call_claude_no_key(image_blocks, prompt, system_prompt, tracker)
+
             import anthropic as _anthropic
 
             active_client = client if active == "claude" else None
@@ -318,13 +485,27 @@ def _grade_chunk(
                     circuit_breaker.check()
                     rate_limiter.acquire()
 
-                    response = active_client.messages.create(
-                        model=get_grading_model("claude"),
-                        max_tokens=max_tokens,
-                        temperature=0,
-                        system=system_prompt,
-                        messages=[{"role": "user", "content": content}],
+                    # Prompt caching: rubric + system prompt repeat verbatim
+                    # across every chunk in a batch and across every student in a
+                    # bulk grading run. Marking the system block ephemeral lets
+                    # Anthropic reuse the cached prefix at ~10% input-token cost
+                    # for calls 2..N within the 5-min cache TTL. The
+                    # student-varying images stay in the user message and are
+                    # never cached.
+                    cached_system = (
+                        [{"type": "text", "text": system_prompt,
+                          "cache_control": {"type": "ephemeral"}}]
+                        if system_prompt else None
                     )
+                    create_kwargs = {
+                        "model": get_grading_model("claude"),
+                        "max_tokens": max_tokens,
+                        "temperature": 0,
+                        "messages": [{"role": "user", "content": content}],
+                    }
+                    if cached_system is not None:
+                        create_kwargs["system"] = cached_system
+                    response = active_client.messages.create(**create_kwargs)
                     circuit_breaker.record_success()
 
                     if tracker:
@@ -390,6 +571,25 @@ def _grade_chunk(
     )
 
 
+# ── Parallel chunk dispatch ────────────────────────────────────────────────
+#
+# Multi-batch grading was sequential with `time.sleep(2)` between calls. The
+# real throttle is the `rate_limiter` inside _grade_chunk, so the sleep is
+# redundant — running batches concurrently is safe and cuts wall time roughly
+# linearly for batch counts up to GRADING_PARALLELISM. Override via env:
+#   GRADING_PARALLELISM=8 python ...
+# Defaults to 4: high enough to overlap network latency, low enough that a
+# typical Anthropic free/paid tier doesn't trip RPM limits with 5–6 chunks.
+
+def _parallelism() -> int:
+    raw = os.environ.get("GRADING_PARALLELISM", "4")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 4
+    return max(1, min(n, 16))
+
+
 def read_page(image_path: str, context: str = "", retries: int = 3) -> str:
     """
     Send a single page image to the active LLM provider and return a transcription.
@@ -422,30 +622,32 @@ def read_all_pages(page_images: list[dict], context: str = "") -> list[dict]:
     """
     Read all page images and return transcriptions.
 
-    Args:
-        page_images: List of dicts from pdf_reader.convert_pdf()
-        context: Optional context for the reader
-
-    Returns:
-        List of dicts with page_number, path, transcription
+    Pages are independent — read in parallel via ThreadPoolExecutor and the
+    shared rate_limiter inside _grade_chunk handles RPM. Order is preserved.
     """
-    results = []
     total = len(page_images)
+    results: list[dict | None] = [None] * total
+    if total == 0:
+        return []
 
-    for i, page in enumerate(page_images):
+    def _read(idx: int, page: dict) -> dict:
         logger.info("Reading page %s/%d...", page["page_number"], total)
-        transcription = read_page(page["path"], context)
-        results.append({
+        return {
             "page_number": page["page_number"],
             "path": page["path"],
-            "transcription": transcription,
-        })
+            "transcription": read_page(page["path"], context),
+        }
 
-        # Brief pause between pages to avoid rate limits
-        if i < total - 1:
-            time.sleep(2)
-
-    return results
+    n_workers = min(_parallelism(), total)
+    if n_workers <= 1:
+        for i, page in enumerate(page_images):
+            results[i] = _read(i, page)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="page-read") as pool:
+            futs = {pool.submit(_read, i, p): i for i, p in enumerate(page_images)}
+            for fut in as_completed(futs):
+                results[futs[fut]] = fut.result()
+    return [r for r in results if r is not None]
 
 
 def grade_exam_with_vision(
@@ -491,38 +693,41 @@ def grade_exam_with_vision(
             image_blocks = build_image_blocks(batches[0], RETRY_MAX_LONG_SIDE, RETRY_JPEG_QUALITY)
             return _grade_chunk(client, image_blocks, grading_prompt, tracker=tracker, provider=provider)
 
-    # Multiple batches — grade each and merge
+    # Multiple batches — grade in parallel and merge.
+    # Order is preserved by _grade_chunks_parallel via job index.
     from grader.chunker import merge_exam_results
 
-    chunk_results = []
-    for i, batch in enumerate(batches):
+    def _grade_one_batch(batch: list[dict]) -> str:
         start_page = batch[0]["page_number"]
         end_page = batch[-1]["page_number"]
-        logger.info("Grading batch %d/%d (pages %s-%s of %d)...", i + 1, len(batches), start_page, end_page, total_pages)
-
         batch_prompt = (
             f"You are grading pages {start_page}-{end_page} of {total_pages} total pages.\n"
             f"Only grade the questions visible on these pages. "
             f"If a question appears to be cut off at the boundary, grade what is visible.\n\n"
             f"{grading_prompt}"
         )
-
         image_blocks = build_image_blocks(batch, max_long_side, jpeg_quality)
         try:
-            result = _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
+            return _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
         except Exception as e:
             if not _should_retry_with_smaller_images(e, provider):
                 raise
-            logger.warning("Retrying batch with smaller images...")
+            logger.warning(
+                "Retrying batch (pages %s-%s) with smaller images...", start_page, end_page,
+            )
             image_blocks = build_image_blocks(batch, RETRY_MAX_LONG_SIDE, RETRY_JPEG_QUALITY)
-            result = _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
+            return _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
 
-        chunk_results.append(result)
+    n_workers = min(_parallelism(), len(batches))
+    logger.info("Grading %d batches in parallel (workers=%d) of %d total pages...",
+                len(batches), n_workers, total_pages)
+    chunk_results: list[str | None] = [None] * len(batches)
+    with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="exam-batch") as pool:
+        futures = {pool.submit(_grade_one_batch, b): i for i, b in enumerate(batches)}
+        for fut in as_completed(futures):
+            chunk_results[futures[fut]] = fut.result()
 
-        if i < len(batches) - 1:
-            time.sleep(2)
-
-    return merge_exam_results(chunk_results)
+    return merge_exam_results([r for r in chunk_results if r is not None])
 
 
 def grade_with_vision(
@@ -587,8 +792,10 @@ def grade_with_vision(
         logger.info("Survey requires %d batches — combining results from all batches", len(survey_batches))
 
     try:
-        survey_responses = []
-        for sb_idx, sb in enumerate(survey_batches):
+        # Survey passes are independent per-batch — run in parallel.
+        survey_system = "You are a document analysis assistant. Identify page content accurately."
+
+        def _run_survey(sb: list[dict]) -> str:
             survey_blocks = build_image_blocks(sb, MAX_IMAGE_LONG_SIDE, 60)
             batch_survey_prompt = survey_prompt
             if len(survey_batches) > 1:
@@ -598,77 +805,104 @@ def grade_with_vision(
                     f"You are surveying pages {start_p}-{end_p} of {len(survey_pages)} total pages.\n\n"
                     + survey_prompt
                 )
-            resp = _grade_chunk(
+            return _grade_chunk(
                 client, survey_blocks, batch_survey_prompt,
-                system_prompt="You are a document analysis assistant. Identify page content accurately.",
+                system_prompt=survey_system,
                 max_tokens=4096,
                 tracker=tracker,
                 provider=provider,
             )
-            survey_responses.append(resp)
-            if sb_idx < len(survey_batches) - 1:
-                time.sleep(2)
-        survey_response = "\n".join(survey_responses)
+
+        survey_responses: list[str | None] = [None] * len(survey_batches)
+        if len(survey_batches) == 1:
+            survey_responses[0] = _run_survey(survey_batches[0])
+        else:
+            n_workers = min(_parallelism(), len(survey_batches))
+            with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="survey") as pool:
+                futs = {pool.submit(_run_survey, sb): i for i, sb in enumerate(survey_batches)}
+                for fut in as_completed(futs):
+                    survey_responses[futs[fut]] = fut.result()
+        survey_response = "\n".join(r for r in survey_responses if r is not None)
     except Exception as e:
         if not _should_retry_with_smaller_images(e, provider):
             raise
-        # Survey failed — fall back to size-aware sequential batching
+        # Survey failed — fall back to size-aware parallel batching.
         logger.warning("Survey pass failed, falling back to size-aware batching...")
-        chunk_results = []
-        for i, batch in enumerate(batches):
+        from grader.chunker import merge_notebook_results as _merge_nb_results
+
+        def _grade_fallback_batch(batch: list[dict]) -> tuple[str, str]:
             start_page = batch[0]["page_number"]
             end_page = batch[-1]["page_number"]
-            logger.info("Grading batch %d/%d (pages %s-%s)...", i + 1, len(batches), start_page, end_page)
             batch_prompt = (
                 f"You are grading pages {start_page}-{end_page} of {len(page_images)} total pages.\n"
                 f"Grade all rubric sections visible on these pages.\n\n{rubric_prompt}"
             )
             image_blocks = build_image_blocks(batch, max_long_side, jpeg_quality)
             try:
-                result = _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
-            except Exception as e:
-                if not _should_retry_with_smaller_images(e, provider):
+                return ("chunk",
+                        _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider))
+            except Exception as exc:
+                if not _should_retry_with_smaller_images(exc, provider):
                     raise
-                logger.warning("Retrying batch with smaller images...")
+                logger.warning("Retrying fallback batch (pages %s-%s) with smaller images...",
+                               start_page, end_page)
                 image_blocks = build_image_blocks(batch, RETRY_MAX_LONG_SIDE, RETRY_JPEG_QUALITY)
-                result = _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider)
-            chunk_results.append(("chunk", result))
-            if i < len(batches) - 1:
-                time.sleep(2)
-        return merge_notebook_results(chunk_results, answer_key)
+                return ("chunk",
+                        _grade_chunk(client, image_blocks, batch_prompt, tracker=tracker, provider=provider))
+
+        chunk_results: list[tuple[str, str] | None] = [None] * len(batches)
+        n_workers = min(_parallelism(), len(batches)) if batches else 1
+        with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="exam-fallback") as pool:
+            futs = {pool.submit(_grade_fallback_batch, b): i for i, b in enumerate(batches)}
+            for fut in as_completed(futs):
+                chunk_results[futs[fut]] = fut.result()
+        return _merge_nb_results([r for r in chunk_results if r is not None], answer_key)
 
     # Parse survey results and plan section-based chunks
     survey_result = parse_survey_response(survey_response)
     section_chunks = plan_chunks_notebook(page_images, survey_result, answer_key)
 
-    section_results = []
-    for i, (section_name, section_pages) in enumerate(section_chunks):
-        # Each section may itself need size-aware batching
+    # Flatten (section, batch) pairs so we can grade them all in parallel.
+    # Order is preserved by submission index for the merge step.
+    section_jobs: list[tuple[str, str, list[dict]]] = []
+    for section_name, section_pages in section_chunks:
         section_batches = batch_pages_by_size(section_pages, max_long_side, jpeg_quality)
-
         for j, batch in enumerate(section_batches):
-            batch_label = f"{section_name}" if len(section_batches) == 1 else f"{section_name} part {j + 1}"
-            logger.info("Grading section %d/%d: %s (%d pages)...", i + 1, len(section_chunks), batch_label, len(batch))
-
-            section_prompt = (
-                f"You are grading ONLY the '{section_name}' section of this student's work.\n"
-                f"The following pages contain content for this section.\n"
-                f"Grade this section according to the rubric below.\n\n{rubric_prompt}"
+            batch_label = (
+                f"{section_name}" if len(section_batches) == 1
+                else f"{section_name} part {j + 1}"
             )
+            section_jobs.append((section_name, batch_label, batch))
 
-            image_blocks = build_image_blocks(batch, max_long_side, jpeg_quality)
-            try:
-                result = _grade_chunk(client, image_blocks, section_prompt, tracker=tracker, provider=provider)
-            except Exception as e:
-                if not _should_retry_with_smaller_images(e, provider):
-                    raise
-                logger.warning("Retrying section '%s' with smaller images...", batch_label)
-                image_blocks = build_image_blocks(batch, RETRY_MAX_LONG_SIDE, RETRY_JPEG_QUALITY)
-                result = _grade_chunk(client, image_blocks, section_prompt, tracker=tracker, provider=provider)
+    def _grade_section_job(job: tuple[str, str, list[dict]]) -> tuple[str, str]:
+        section_name, batch_label, batch = job
+        section_prompt = (
+            f"You are grading ONLY the '{section_name}' section of this student's work.\n"
+            f"The following pages contain content for this section.\n"
+            f"Grade this section according to the rubric below.\n\n{rubric_prompt}"
+        )
+        image_blocks = build_image_blocks(batch, max_long_side, jpeg_quality)
+        try:
+            result = _grade_chunk(client, image_blocks, section_prompt, tracker=tracker, provider=provider)
+        except Exception as exc:
+            if not _should_retry_with_smaller_images(exc, provider):
+                raise
+            logger.warning("Retrying section '%s' with smaller images...", batch_label)
+            image_blocks = build_image_blocks(batch, RETRY_MAX_LONG_SIDE, RETRY_JPEG_QUALITY)
+            result = _grade_chunk(client, image_blocks, section_prompt, tracker=tracker, provider=provider)
+        return (section_name, result)
 
-            section_results.append((section_name, result))
+    n_workers = min(_parallelism(), len(section_jobs)) if section_jobs else 1
+    logger.info("Grading %d section batches in parallel (workers=%d)...",
+                len(section_jobs), n_workers)
+    section_results: list[tuple[str, str] | None] = [None] * len(section_jobs)
+    if n_workers <= 1:
+        for idx, job in enumerate(section_jobs):
+            section_results[idx] = _grade_section_job(job)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="section") as pool:
+            futs = {pool.submit(_grade_section_job, j): i for i, j in enumerate(section_jobs)}
+            for fut in as_completed(futs):
+                section_results[futs[fut]] = fut.result()
 
-            if not (i == len(section_chunks) - 1 and j == len(section_batches) - 1):
-                time.sleep(2)
-
-    return merge_notebook_results(section_results, answer_key)
+    return merge_notebook_results([r for r in section_results if r is not None], answer_key)

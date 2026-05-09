@@ -192,7 +192,14 @@ def _execute_claude(
         "messages": [{"role": "user", "content": content}],
     }
     if system_prompt:
-        kwargs["system"] = system_prompt
+        # Prompt caching: system prompts here are rubric/explainer/integrity
+        # prompts that repeat verbatim across every call in a batch. Mark the
+        # system block ephemeral so Anthropic reuses the cached prefix at ~10%
+        # input cost on calls 2..N within the 5-min TTL.
+        kwargs["system"] = [
+            {"type": "text", "text": system_prompt,
+             "cache_control": {"type": "ephemeral"}}
+        ]
 
     from grader.retry import rate_limiter, circuit_breaker
     import random as _random
