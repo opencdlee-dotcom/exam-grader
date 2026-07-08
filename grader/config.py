@@ -104,7 +104,13 @@ def get_grading_api_key(provider: str | None = None) -> str | None:
 
 
 def provider_is_configured(provider: str | None = None) -> bool:
-    """Return True when the provider can run — has an API key, a reachable local service, or a CLI on PATH."""
+    """Return True when the provider can run — has an API key, a reachable local service, or a CLI on PATH.
+
+    For ``claude`` specifically, also accept the no-key paths (logged-in
+    claude.ai Playwright session OR `claude` CLI on PATH). These mirror
+    what notebook-grader uses, and `_call_claude_no_key` in vision.py
+    routes through them when the API key is missing.
+    """
     active = normalize_grading_provider(provider)
     if active == "gemma":
         # Assume configured; the executor will surface Ollama connection errors.
@@ -114,7 +120,26 @@ def provider_is_configured(provider: str | None = None) -> bool:
         head = (CODEX_CMD or "").split()
         return bool(head and shutil.which(head[0]))
     api_key = get_grading_api_key(active)
-    return bool(api_key and api_key != "your-api-key-here")
+    if api_key and api_key != "your-api-key-here":
+        return True
+    if active == "claude" and _claude_no_key_path_available():
+        return True
+    return False
+
+
+def _claude_no_key_path_available() -> bool:
+    """True when the user has a logged-in claude.ai session or `claude` CLI."""
+    import os
+    import shutil
+    # Mirrors notebook_grader.playwright_grader._BROWSER_DATA_DIR — kept
+    # in-sync rather than imported so this function stays cheap and free
+    # of optional dependencies.
+    browser_data_dir = os.path.join(
+        os.path.expanduser("~"), ".professor-os", "claude-browser-data"
+    )
+    if os.path.isdir(browser_data_dir):
+        return True
+    return shutil.which("claude") is not None
 
 
 def get_provider_fallback_order(provider: str | None = None) -> list[str]:
