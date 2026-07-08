@@ -96,7 +96,7 @@ class GraderSettings(BaseSettings):
 
     # -- Model --
     claude_model: str = Field(
-        default="claude-sonnet-4-20250514",
+        default="claude-sonnet-5",
         alias="CLAUDE_MODEL",
     )
     openai_model: str = Field(

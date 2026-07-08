@@ -520,7 +520,12 @@ def _grade_chunk(
                     create_kwargs = {
                         "model": get_grading_model("claude"),
                         "max_tokens": max_tokens,
-                        "temperature": 0,
+                        # No temperature: Sonnet 5+ rejects non-default sampling
+                        # params with a 400. Thinking explicitly off — Sonnet 5
+                        # defaults to adaptive thinking when the field is omitted,
+                        # which would change grading behavior and eat the token
+                        # budget.
+                        "thinking": {"type": "disabled"},
                         "messages": [{"role": "user", "content": content}],
                     }
                     if cached_system is not None:
