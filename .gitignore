@@ -7,3 +7,11 @@ dist/
 .venv/
 .pytest_cache/
 .DS_Store
+
+# settings.py declares env_file=".env", so a local .env is the intended
+# place for GOOGLE_SHARE_EMAIL, API keys, and anything else per-operator.
+# This repo is PUBLIC — an un-ignored .env is one `git add -A` away from
+# publishing a live credential to the world.
+.env
+.env.*
+!.env.example

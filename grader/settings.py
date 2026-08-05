@@ -225,8 +225,14 @@ class GraderSettings(BaseSettings):
     )
 
     # -- Google Sheets --
+    # No default: this is a PUBLIC package, and the previous default was a
+    # real personal address, so every install shipped one operator's email
+    # and every reader of the repo could see it. Set GOOGLE_SHARE_EMAIL in
+    # the environment or a local .env; when it is unset, sheets.py skips
+    # the share step and says so rather than mailing a stranger's sheet to
+    # whoever happens to be baked into the source.
     google_share_email: str = Field(
-        default="charlson.lee.055@my.csun.edu",
+        default="",
         alias="GOOGLE_SHARE_EMAIL",
     )
 

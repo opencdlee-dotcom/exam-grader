@@ -194,16 +194,29 @@ def create_grade_sheet(results: list[dict], sheet_name: str) -> str:
         "--json", json.dumps(format_requests),
     ])
 
-    # --- Step 5: Share with configured email ---
-    _gws([
-        "drive", "permissions", "create",
-        "--params", json.dumps({"fileId": spreadsheet_id}),
-        "--json", json.dumps({
-            "type": "user",
-            "role": "writer",
-            "emailAddress": GOOGLE_SHARE_EMAIL,
-        }),
-    ])
-    logger.info("Shared with %s", GOOGLE_SHARE_EMAIL)
+    # --- Step 5: Share with configured email (opt-in) ---
+    # Unset is the DEFAULT now (see settings.google_share_email): this is a
+    # public package and the old default was a real personal address. Skip
+    # loudly rather than silently — a grader who expected the sheet in their
+    # inbox needs to know why it isn't there, and the sheet itself is
+    # already created and reachable at the URL returned below.
+    if GOOGLE_SHARE_EMAIL:
+        _gws([
+            "drive", "permissions", "create",
+            "--params", json.dumps({"fileId": spreadsheet_id}),
+            "--json", json.dumps({
+                "type": "user",
+                "role": "writer",
+                "emailAddress": GOOGLE_SHARE_EMAIL,
+            }),
+        ])
+        logger.info("Shared with %s", GOOGLE_SHARE_EMAIL)
+    else:
+        logger.warning(
+            "GOOGLE_SHARE_EMAIL is unset — created the sheet but shared it "
+            "with no one. Set it in the environment or a local .env to have "
+            "results shared automatically. Sheet: %s",
+            spreadsheet_url,
+        )
 
     return spreadsheet_url
